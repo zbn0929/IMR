@@ -85,6 +85,13 @@ class Config:
     DL_LABEL_SMOOTHING: float = 0.05  # Label smoothing.
     LOSS_WEIGHT_EMOTION: float = 1.0
     LOSS_WEIGHT_CAUSE: float = 1.0
+    # Cause labels are event-level and can drift by fold; "balanced" computes
+    # inverse-frequency class weights from each training fold.
+    CAUSE_CLASS_WEIGHT_MODE: str = "balanced"  # "none" | "balanced"
+    DL_TUNE_DECISION_THRESHOLD: bool = True
+    DL_THRESHOLD_MIN: float = 0.05
+    DL_THRESHOLD_MAX: float = 0.95
+    DL_THRESHOLD_STEPS: int = 181
 
     # --- IMR (Iterative Mutual Refinement) architecture parameters ---
     # Ablation modes:

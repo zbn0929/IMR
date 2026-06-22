@@ -13,6 +13,7 @@ from typing import Optional, Tuple, Dict, List, Any
 
 import torch
 import torch.nn as nn
+import numpy as np
 from torch.utils.data import DataLoader
 from torch.optim import AdamW
 from torch.optim.lr_scheduler import ReduceLROnPlateau
@@ -36,11 +37,13 @@ def _evaluate_iece_metrics(
     dataloader: DataLoader,
     device: torch.device,
     loss_fn: Optional[nn.Module] = None,
+    threshold: Optional[float] = None,
+    tune_threshold: bool = Config.DL_TUNE_DECISION_THRESHOLD,
 ) -> Dict[str, float]:
     """Collect IECE cause extraction metrics in one pass, optionally with val_loss."""
     model.eval()
 
-    cause_preds: List[int] = []
+    cause_probs: List[float] = []
     cause_labels_all: List[int] = []
     total_val_loss = 0.0
     n_batches = 0
@@ -83,11 +86,16 @@ def _evaluate_iece_metrics(
                 total_val_loss += float(loss.item())
                 n_batches += 1
 
-            cause_pred = torch.argmax(cause_logits, dim=-1).cpu()
+            cause_prob = torch.softmax(cause_logits, dim=-1)[:, 1].cpu()
             cause_labels_cpu = cause_labels.cpu()
 
-            cause_preds.extend(cause_pred.tolist())
+            cause_probs.extend(cause_prob.tolist())
             cause_labels_all.extend(cause_labels_cpu.tolist())
+
+    selected_threshold = 0.5 if threshold is None else float(threshold)
+    if threshold is None and tune_threshold:
+        selected_threshold = _find_best_threshold(cause_probs, cause_labels_all)
+    cause_preds = [int(prob >= selected_threshold) for prob in cause_probs]
 
     precision = float(
         precision_score(cause_labels_all, cause_preds, pos_label=1, zero_division=0)
@@ -102,7 +110,70 @@ def _evaluate_iece_metrics(
         "val_recall": recall,
         "val_f1": f1,
         "val_loss": total_val_loss / max(n_batches, 1) if n_batches > 0 else 0.0,
+        "val_threshold": selected_threshold,
     }
+
+
+def _find_best_threshold(probs: List[float], labels: List[int]) -> float:
+    """Pick the threshold with the highest positive-class F1 on validation data."""
+    if not probs:
+        return 0.5
+
+    best_threshold = 0.5
+    best_f1 = -1.0
+    thresholds = np.linspace(
+        Config.DL_THRESHOLD_MIN,
+        Config.DL_THRESHOLD_MAX,
+        Config.DL_THRESHOLD_STEPS,
+    )
+    for threshold in thresholds:
+        preds = [int(prob >= threshold) for prob in probs]
+        f1 = float(f1_score(labels, preds, pos_label=1, zero_division=0))
+        if f1 > best_f1:
+            best_f1 = f1
+            best_threshold = float(threshold)
+    return best_threshold
+
+
+def _get_cause_class_weights(
+    train_loader: DataLoader,
+    device: torch.device,
+) -> Optional[torch.Tensor]:
+    """Compute inverse-frequency cause class weights from the current training fold."""
+    mode = Config.CAUSE_CLASS_WEIGHT_MODE.lower().strip()
+    if mode in {"", "none", "off", "false"}:
+        return None
+    if mode != "balanced":
+        raise ValueError(
+            f"Invalid CAUSE_CLASS_WEIGHT_MODE='{Config.CAUSE_CLASS_WEIGHT_MODE}'. "
+            "Expected 'none' or 'balanced'."
+        )
+
+    dataset = train_loader.dataset
+    pairs = getattr(dataset, "pairs", None)
+    if pairs is None:
+        logger.warning("Could not inspect training labels; cause class weights disabled.")
+        return None
+
+    counts = [0, 0]
+    for pair in pairs:
+        counts[int(pair.cause_label)] += 1
+    if min(counts) == 0:
+        logger.warning(f"Degenerate cause-label distribution {counts}; class weights disabled.")
+        return None
+
+    total = float(sum(counts))
+    weights = torch.tensor(
+        [total / (2.0 * counts[0]), total / (2.0 * counts[1])],
+        dtype=torch.float32,
+        device=device,
+    )
+    logger.info(
+        "Cause class weights enabled: "
+        f"non_cause={weights[0].item():.4f}, cause={weights[1].item():.4f} "
+        f"from counts={counts}"
+    )
+    return weights
 
 
 def evaluate(
@@ -252,8 +323,10 @@ def train(
         f"with early-stopping patience {patience}"
     )
 
+    cause_class_weights = _get_cause_class_weights(train_loader, device)
     loss_fn = IMRLoss(
         label_smoothing=Config.DL_LABEL_SMOOTHING,
+        cause_class_weights=cause_class_weights,
     )
     loss_fn = loss_fn.to(device)
 
@@ -282,10 +355,16 @@ def train(
         "val_recall": 0.0,
         "val_loss": 0.0,
         "train_loss": 0.0,
+        "val_threshold": 0.5,
     }
     epochs_no_improve = 0
 
     for epoch in range(epochs):
+        if epoch < warmup_epochs:
+            scale = (epoch + 1) / max(warmup_epochs, 1)
+            for group in optimizer.param_groups:
+                group["lr"] = group.get("initial_lr", learning_rate) * scale
+
         model.train()
         epoch_loss = 0.0
 
@@ -334,12 +413,6 @@ def train(
             epoch_loss += loss.item()
             pbar.set_postfix({"loss": loss.item()})
 
-        # LR warmup for the first warmup_epochs, then ReduceLROnPlateau takes over.
-        if epoch < warmup_epochs:
-            scale = (epoch + 1) / warmup_epochs
-            for g in optimizer.param_groups:
-                g["lr"] = g.get("initial_lr", learning_rate) * scale
-
         avg_train_loss = epoch_loss / max(len(train_loader), 1)
         eval_metrics = _evaluate_iece_metrics(
             model=model,
@@ -351,6 +424,7 @@ def train(
         recall = eval_metrics["val_recall"]
         f1 = eval_metrics["val_f1"]
         avg_val_loss = eval_metrics["val_loss"]
+        threshold = eval_metrics["val_threshold"]
 
         if recall >= 0.99 and precision < 0.95:
             logger.warning(
@@ -361,7 +435,8 @@ def train(
         logger.info(
             f"Epoch {epoch+1}/{epochs} | Train Loss: {avg_train_loss:.4f} | "
             f"Val Loss: {avg_val_loss:.4f} | "
-            f"IECE P: {precision:.4f} R: {recall:.4f} F1: {f1:.4f}"
+            f"IECE P: {precision:.4f} R: {recall:.4f} F1: {f1:.4f} | "
+            f"Threshold: {threshold:.3f}"
         )
         if metrics_logger is not None:
             metrics_logger.log(
@@ -375,6 +450,7 @@ def train(
                     "val_precision": precision,
                     "val_recall": recall,
                     "val_f1": f1,
+                    "val_threshold": threshold,
                 }
             )
 
@@ -388,6 +464,7 @@ def train(
                 "val_recall": recall,
                 "val_loss": avg_val_loss,
                 "train_loss": avg_train_loss,
+                "val_threshold": threshold,
             }
             epochs_no_improve = 0
             logger.info(f"  --> New Best IECE F1: {best_f1:.4f}")
@@ -505,6 +582,7 @@ def train_kfold(
                 "val_loss": best_metrics["val_loss"],
                 "train_loss": best_metrics["train_loss"],
                 "best_epoch": best_metrics["best_epoch"],
+                "val_threshold": best_metrics["val_threshold"],
             }
         )
         fold_f1_scores.append(best_f1)

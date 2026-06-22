@@ -108,13 +108,17 @@ class IMRLoss(nn.Module):
         label_smoothing: float,
         emotion_weight: float = Config.LOSS_WEIGHT_EMOTION,
         cause_weight: float = Config.LOSS_WEIGHT_CAUSE,
+        cause_class_weights: Optional[torch.Tensor] = None,
     ):
         super().__init__()
         self.emotion_ce = nn.CrossEntropyLoss(
             ignore_index=-1,
             label_smoothing=label_smoothing,
         )
-        self.cause_ce = nn.CrossEntropyLoss(label_smoothing=label_smoothing)
+        self.cause_ce = nn.CrossEntropyLoss(
+            weight=cause_class_weights,
+            label_smoothing=label_smoothing,
+        )
         self.emotion_weight = float(emotion_weight)
         self.cause_weight = float(cause_weight)
 
