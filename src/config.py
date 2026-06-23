@@ -85,6 +85,8 @@ class Config:
     DL_LABEL_SMOOTHING: float = 0.05  # Label smoothing.
     LOSS_WEIGHT_EMOTION: float = 1.0
     LOSS_WEIGHT_CAUSE: float = 1.0
+    CAUSE_LOSS_TYPE: str = "focal"  # "ce" | "focal"
+    CAUSE_FOCAL_GAMMA: float = 1.5
     # Cause labels are event-level and can drift by fold; "balanced" computes
     # inverse-frequency class weights from each training fold.
     CAUSE_CLASS_WEIGHT_MODE: str = "balanced"  # "none" | "balanced"
@@ -107,6 +109,11 @@ class Config:
     # True: use standalone event_emb, encoded from event text only.
     # False: use concat_emb, encoded from text and event together as in v2.
     DL_USE_EVENT_EMB: bool = True  # Enable task-aligned event-specific embeddings.
+    # Cause input mode:
+    # - "event": event-only cause branch, compatible with the old v3 model
+    # - "concat": text+event context branch
+    # - "dual": v4 dual-view event/context gated cause branch
+    DL_CAUSE_INPUT_MODE: str = "dual"
 
     @classmethod
     def apply_dataset_type(cls, dataset_type: str | None = None):

@@ -8,6 +8,7 @@ sys.path.insert(0, str(project_root))
 
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 from typing import Dict, List, Optional
 
 from src.config import Config
@@ -115,10 +116,24 @@ class IMRLoss(nn.Module):
             ignore_index=-1,
             label_smoothing=label_smoothing,
         )
+        self.cause_loss_type = Config.CAUSE_LOSS_TYPE.lower().strip()
+        if self.cause_loss_type not in {"ce", "focal"}:
+            raise ValueError(
+                f"Invalid CAUSE_LOSS_TYPE='{Config.CAUSE_LOSS_TYPE}'. "
+                "Expected 'ce' or 'focal'."
+            )
         self.cause_ce = nn.CrossEntropyLoss(
             weight=cause_class_weights,
             label_smoothing=label_smoothing,
         )
+        self.register_buffer(
+            "cause_class_weights",
+            cause_class_weights.detach().clone()
+            if cause_class_weights is not None
+            else None,
+        )
+        self.label_smoothing = float(label_smoothing)
+        self.focal_gamma = float(Config.CAUSE_FOCAL_GAMMA)
         self.emotion_weight = float(emotion_weight)
         self.cause_weight = float(cause_weight)
 
@@ -130,8 +145,27 @@ class IMRLoss(nn.Module):
         cause_labels: torch.Tensor,
     ):
         emotion_loss = self.emotion_ce(emotion_logits, emotion_labels)
-        cause_loss = self.cause_ce(cause_logits, cause_labels)
+        if self.cause_loss_type == "focal":
+            cause_loss = self._focal_cause_loss(cause_logits, cause_labels)
+        else:
+            cause_loss = self.cause_ce(cause_logits, cause_labels)
         return self.emotion_weight * emotion_loss + self.cause_weight * cause_loss
+
+    def _focal_cause_loss(
+        self,
+        logits: torch.Tensor,
+        labels: torch.Tensor,
+    ) -> torch.Tensor:
+        ce = F.cross_entropy(
+            logits,
+            labels,
+            weight=self.cause_class_weights,
+            label_smoothing=self.label_smoothing,
+            reduction="none",
+        )
+        pt = torch.softmax(logits, dim=-1).gather(1, labels.unsqueeze(1)).squeeze(1)
+        focal = (1.0 - pt).clamp_min(1e-6).pow(self.focal_gamma)
+        return (focal * ce).mean()
 
 
 # ===========================================================================
@@ -268,6 +302,63 @@ class StateRefinementModule(nn.Module):
         return self.norm(state_old + update)
 
 
+class StateFusionGate(nn.Module):
+    """Fuse event-only and context-aware cause states with a learned gate."""
+
+    def __init__(self, d_model: int, dropout: float = 0.1):
+        super().__init__()
+        self.gate = nn.Sequential(
+            nn.Linear(d_model * 4, d_model),
+            nn.GELU(),
+            nn.Dropout(dropout),
+            nn.Linear(d_model, d_model),
+            nn.Sigmoid(),
+        )
+        self.out = nn.Sequential(
+            nn.Linear(d_model * 2, d_model),
+            nn.GELU(),
+            nn.Dropout(dropout),
+            nn.Linear(d_model, d_model),
+            nn.Dropout(dropout),
+        )
+        self.norm = nn.LayerNorm(d_model)
+
+    def forward(self, event_state: torch.Tensor, context_state: torch.Tensor) -> torch.Tensor:
+        features = torch.cat(
+            [
+                event_state,
+                context_state,
+                torch.abs(event_state - context_state),
+                event_state * context_state,
+            ],
+            dim=-1,
+        )
+        gate = self.gate(features)
+        fused = gate * event_state + (1.0 - gate) * context_state
+        update = self.out(torch.cat([fused, features[:, : event_state.size(-1)]], dim=-1))
+        return self.norm(fused + update)
+
+
+class EmotionConditionedState(nn.Module):
+    """Use the final emotion state to modulate cause prediction features."""
+
+    def __init__(self, d_model: int, dropout: float = 0.1):
+        super().__init__()
+        self.affine = nn.Sequential(
+            nn.Linear(d_model, d_model * 2),
+            nn.GELU(),
+            nn.Dropout(dropout),
+            nn.Linear(d_model * 2, d_model * 2),
+        )
+        self.norm = nn.LayerNorm(d_model)
+
+    def forward(self, cause_state: torch.Tensor, emotion_state: torch.Tensor) -> torch.Tensor:
+        gamma, beta = self.affine(emotion_state).chunk(2, dim=-1)
+        gamma = torch.tanh(gamma)
+        conditioned = cause_state * (1.0 + gamma) + beta
+        return self.norm(cause_state + conditioned)
+
+
 class IMRModel(nn.Module):
     """
     IMR (Iterative Mutual Refinement) model v3.
@@ -284,7 +375,8 @@ class IMRModel(nn.Module):
         num_emotions        Number of emotion classes.
         n_iterations        Number of iterative interaction rounds T, default 3.
         dropout             Dropout rate.
-        use_event_emb       Whether to use event_emb (True) or concat_emb (False).
+        use_event_emb       Backward-compatible input selector for non-dual modes.
+        cause_input_mode    "event" | "concat" | "dual".
         ablation_mode       Ablation mode: "full" | "wo_imr" | "wo_backward".
     """
 
@@ -300,6 +392,7 @@ class IMRModel(nn.Module):
         n_iterations: int = Config.DL_IMR_ITERATIONS,
         dropout: float = Config.DL_DROPOUT,
         use_event_emb: bool = Config.DL_USE_EVENT_EMB,
+        cause_input_mode: str = Config.DL_CAUSE_INPUT_MODE,
         ablation_mode: str = Config.DL_ABLATION_MODE,
     ):
         super().__init__()
@@ -307,6 +400,14 @@ class IMRModel(nn.Module):
         self.num_emotions = num_emotions
         self.n_iterations = n_iterations
         self.use_event_emb = use_event_emb
+        valid_cause_modes = {"event", "concat", "dual"}
+        cause_input_mode = cause_input_mode.lower().strip()
+        if cause_input_mode not in valid_cause_modes:
+            raise ValueError(
+                f"Invalid cause_input_mode='{cause_input_mode}'. "
+                f"Expected one of {sorted(valid_cause_modes)}."
+            )
+        self.cause_input_mode = cause_input_mode
         valid_modes = {"full", "wo_imr", "wo_backward"}
         if ablation_mode not in valid_modes:
             raise ValueError(
@@ -318,6 +419,8 @@ class IMRModel(nn.Module):
         # Input projections.
         self.emotion_proj = nn.Linear(hidden_size, d_model)
         self.cause_proj = nn.Linear(hidden_size, d_model)
+        self.cause_event_proj = nn.Linear(hidden_size, d_model)
+        self.cause_context_proj = nn.Linear(hidden_size, d_model)
 
         # ===== Stage 1: independent feature encoding =====
         self.emotion_encoder = TextEncoder(
@@ -334,10 +437,27 @@ class IMRModel(nn.Module):
             n_layers=n_cause_layers,
             dropout=dropout,
         )
+        self.cause_event_encoder = TextEncoder(
+            d_model=d_model,
+            nhead=nhead,
+            dim_feedforward=dim_feedforward,
+            n_layers=n_cause_layers,
+            dropout=dropout,
+        )
+        self.cause_context_encoder = TextEncoder(
+            d_model=d_model,
+            nhead=nhead,
+            dim_feedforward=dim_feedforward,
+            n_layers=n_cause_layers,
+            dropout=dropout,
+        )
 
         # ===== Stage 2: initial state pooling =====
         self.emotion_attn_pool = AttentionPool(d_model)
         self.cause_attn_pool = AttentionPool(d_model)
+        self.cause_event_attn_pool = AttentionPool(d_model)
+        self.cause_context_attn_pool = AttentionPool(d_model)
+        self.cause_state_fusion = StateFusionGate(d_model, dropout)
 
         # ===== Stage 3: iterative interaction modules =====
         # Emotion update: gather clues from Cause.
@@ -347,6 +467,7 @@ class IMRModel(nn.Module):
         # Cause update: gather emotion priors from Emotion.
         self.cause_from_emo_attn = CrossAttentionInteraction(d_model, dropout)
         self.cause_refinement = StateRefinementModule(d_model, dropout)
+        self.cause_output_conditioner = EmotionConditionedState(d_model, dropout)
 
         # ===== Stage 4: final prediction heads =====
         self.emotion_head = nn.Sequential(
@@ -371,6 +492,8 @@ class IMRModel(nn.Module):
         cause_input_emb: torch.Tensor,  # (B, L, H) event_emb or concat_emb
         text_padding_mask: Optional[torch.Tensor] = None,  # (B, L) True=padding
         cause_padding_mask: Optional[torch.Tensor] = None,  # (B, L) True=padding
+        concat_input_emb: Optional[torch.Tensor] = None,  # (B, L, H) concat_emb
+        concat_padding_mask: Optional[torch.Tensor] = None,  # (B, L) True=padding
         return_intermediate: bool = False,
     ):
         """
@@ -384,12 +507,15 @@ class IMRModel(nn.Module):
             emotion_seq, text_padding_mask
         )  # (B, L, d)
 
-        cause_seq = self.cause_proj(cause_input_emb)  # (B, L, d)
-        cause_feats = self.cause_encoder(cause_seq, cause_padding_mask)  # (B, L, d)
+        cause_feats, cause_padding_mask, cause_state = self._encode_cause_view(
+            cause_input_emb=cause_input_emb,
+            concat_input_emb=concat_input_emb,
+            cause_padding_mask=cause_padding_mask,
+            concat_padding_mask=concat_padding_mask,
+        )
 
         # ===== Stage 2: initial states =====
         emo_state = self.emotion_attn_pool(emotion_feats, text_padding_mask)  # (B, d)
-        cause_state = self.cause_attn_pool(cause_feats, cause_padding_mask)  # (B, d)
 
         intermediates: List[Dict[str, torch.Tensor]] = []
 
@@ -426,7 +552,8 @@ class IMRModel(nn.Module):
                 _record(i + 1, emo_state, cause_state)
 
             emotion_logits = self.emotion_head(emo_state)  # (B, num_emotions)
-            cause_logits = self.cause_head(cause_state)  # (B, 2)
+            cause_pred_state = self.cause_output_conditioner(cause_state, emo_state)
+            cause_logits = self.cause_head(cause_pred_state)  # (B, 2)
             if return_intermediate:
                 return emotion_logits, cause_logits, intermediates
             return emotion_logits, cause_logits
@@ -454,8 +581,57 @@ class IMRModel(nn.Module):
 
         # ===== Stage 4: final prediction =====
         emotion_logits = self.emotion_head(emo_state)  # (B, 7)
-        cause_logits = self.cause_head(cause_state)  # (B, 2)
+        cause_pred_state = self.cause_output_conditioner(cause_state, emo_state)
+        cause_logits = self.cause_head(cause_pred_state)  # (B, 2)
 
         if return_intermediate:
             return emotion_logits, cause_logits, intermediates
         return emotion_logits, cause_logits
+
+    def _encode_cause_view(
+        self,
+        cause_input_emb: torch.Tensor,
+        concat_input_emb: Optional[torch.Tensor],
+        cause_padding_mask: Optional[torch.Tensor],
+        concat_padding_mask: Optional[torch.Tensor],
+    ) -> tuple[torch.Tensor, Optional[torch.Tensor], torch.Tensor]:
+        if self.cause_input_mode == "event":
+            cause_seq = self.cause_proj(cause_input_emb)
+            cause_feats = self.cause_encoder(cause_seq, cause_padding_mask)
+            cause_state = self.cause_attn_pool(cause_feats, cause_padding_mask)
+            return cause_feats, cause_padding_mask, cause_state
+
+        if self.cause_input_mode == "concat":
+            context_emb = concat_input_emb if concat_input_emb is not None else cause_input_emb
+            context_mask = concat_padding_mask
+            if context_mask is None:
+                context_mask = cause_padding_mask
+            cause_seq = self.cause_proj(context_emb)
+            cause_feats = self.cause_encoder(cause_seq, context_mask)
+            cause_state = self.cause_attn_pool(cause_feats, context_mask)
+            return cause_feats, context_mask, cause_state
+
+        if concat_input_emb is None:
+            concat_input_emb = cause_input_emb
+        if concat_padding_mask is None:
+            concat_padding_mask = cause_padding_mask
+
+        event_seq = self.cause_event_proj(cause_input_emb)
+        event_feats = self.cause_event_encoder(event_seq, cause_padding_mask)
+        event_state = self.cause_event_attn_pool(event_feats, cause_padding_mask)
+
+        context_seq = self.cause_context_proj(concat_input_emb)
+        context_feats = self.cause_context_encoder(context_seq, concat_padding_mask)
+        context_state = self.cause_context_attn_pool(context_feats, concat_padding_mask)
+
+        cause_feats = torch.cat([event_feats, context_feats], dim=1)
+        if cause_padding_mask is None and concat_padding_mask is None:
+            fused_mask = None
+        else:
+            if cause_padding_mask is None:
+                cause_padding_mask = torch.zeros_like(concat_padding_mask)
+            if concat_padding_mask is None:
+                concat_padding_mask = torch.zeros_like(cause_padding_mask)
+            fused_mask = torch.cat([cause_padding_mask, concat_padding_mask], dim=1)
+        cause_state = self.cause_state_fusion(event_state, context_state)
+        return cause_feats, fused_mask, cause_state

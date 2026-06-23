@@ -64,9 +64,17 @@ def _evaluate_iece_metrics(
             if event_padding_mask is not None:
                 event_padding_mask = event_padding_mask.to(device)
 
-            cause_input_emb = event_emb if Config.DL_USE_EVENT_EMB else concat_emb
+            concat_padding_mask = batch.get("concat_padding_mask", None)
+            if concat_padding_mask is not None:
+                concat_padding_mask = concat_padding_mask.to(device)
+
+            cause_input_emb = (
+                concat_emb if Config.DL_CAUSE_INPUT_MODE == "concat" else event_emb
+            )
             cause_padding_mask = (
-                event_padding_mask if Config.DL_USE_EVENT_EMB else text_padding_mask
+                concat_padding_mask
+                if Config.DL_CAUSE_INPUT_MODE == "concat"
+                else event_padding_mask
             )
 
             emotion_logits, cause_logits = model(
@@ -74,6 +82,8 @@ def _evaluate_iece_metrics(
                 cause_input_emb=cause_input_emb,
                 text_padding_mask=text_padding_mask,
                 cause_padding_mask=cause_padding_mask,
+                concat_input_emb=concat_emb,
+                concat_padding_mask=concat_padding_mask,
             )
 
             if loss_fn is not None:
@@ -209,9 +219,7 @@ def configure_optimizer(
             ("emotion_proj", "emotion_encoder", "emotion_attn_pool", "emotion_head")
         ):
             emotion_params.append(param)
-        elif name.startswith(
-            ("cause_proj", "cause_encoder", "cause_attn_pool", "cause_head")
-        ):
+        elif name.startswith("cause_"):
             cause_params.append(param)
         else:
             shared_params.append(param)
@@ -385,10 +393,18 @@ def train(
             if event_padding_mask is not None:
                 event_padding_mask = event_padding_mask.to(device)
 
+            concat_padding_mask = batch.get("concat_padding_mask", None)
+            if concat_padding_mask is not None:
+                concat_padding_mask = concat_padding_mask.to(device)
+
             # Select the cause input according to configuration.
-            cause_input_emb = event_emb if Config.DL_USE_EVENT_EMB else concat_emb
+            cause_input_emb = (
+                concat_emb if Config.DL_CAUSE_INPUT_MODE == "concat" else event_emb
+            )
             cause_padding_mask = (
-                event_padding_mask if Config.DL_USE_EVENT_EMB else text_padding_mask
+                concat_padding_mask
+                if Config.DL_CAUSE_INPUT_MODE == "concat"
+                else event_padding_mask
             )
 
             emotion_logits, cause_logits = model(
@@ -396,6 +412,8 @@ def train(
                 cause_input_emb=cause_input_emb,
                 text_padding_mask=text_padding_mask,
                 cause_padding_mask=cause_padding_mask,
+                concat_input_emb=concat_emb,
+                concat_padding_mask=concat_padding_mask,
             )
 
             loss = loss_fn(
@@ -552,6 +570,7 @@ def train_kfold(
             n_iterations=Config.DL_IMR_ITERATIONS,
             dropout=Config.DL_DROPOUT,
             use_event_emb=Config.DL_USE_EVENT_EMB,
+            cause_input_mode=Config.DL_CAUSE_INPUT_MODE,
             ablation_mode=ablation_mode,
         ).to(device)
 

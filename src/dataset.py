@@ -122,6 +122,7 @@ class IECEDataset(Dataset):
         event_embs: np.ndarray,
         indices: Optional[List[int]] = None,
         text_masks: Optional[np.ndarray] = None,
+        concat_masks: Optional[np.ndarray] = None,
         event_masks: Optional[np.ndarray] = None,
     ):
         if indices is None:
@@ -147,6 +148,7 @@ class IECEDataset(Dataset):
         self.event_embs = event_embs
         self.indices = indices
         self.text_masks = text_masks
+        self.concat_masks = concat_masks
         self.event_masks = event_masks
 
     def __len__(self) -> int:
@@ -177,6 +179,10 @@ class IECEDataset(Dataset):
             result["key_padding_mask"] = torch.from_numpy(
                 self.text_masks[emb_idx].astype(bool)
             )
+        if self.concat_masks is not None:
+            result["concat_padding_mask"] = torch.from_numpy(
+                self.concat_masks[emb_idx].astype(bool)
+            )
         if self.event_masks is not None:
             result["event_padding_mask"] = torch.from_numpy(
                 self.event_masks[emb_idx].astype(bool)
@@ -193,6 +199,7 @@ def build_dataloaders(
     fold_train_indices: List[int],
     fold_val_indices: List[int],
     labeled_text_masks: Optional[np.ndarray] = None,
+    labeled_concat_masks: Optional[np.ndarray] = None,
     labeled_event_masks: Optional[np.ndarray] = None,
     batch_size: int = Config.DL_BATCH_SIZE,
     num_workers: int = 0,
@@ -205,6 +212,7 @@ def build_dataloaders(
         labeled_event_embs,
         indices=fold_train_indices,
         text_masks=labeled_text_masks,
+        concat_masks=labeled_concat_masks,
         event_masks=labeled_event_masks,
     )
     val_dataset = IECEDataset(
@@ -214,6 +222,7 @@ def build_dataloaders(
         labeled_event_embs,
         indices=fold_val_indices,
         text_masks=labeled_text_masks,
+        concat_masks=labeled_concat_masks,
         event_masks=labeled_event_masks,
     )
 
@@ -260,6 +269,7 @@ def load_all_data(
     logger.info(f"  labeled_event.npy: {labeled_event_embs.shape}")
 
     labeled_text_masks: Optional[np.ndarray] = None
+    labeled_concat_masks: Optional[np.ndarray] = None
     labeled_event_masks: Optional[np.ndarray] = None
     if (emb_dir / "labeled_text_mask.npy").exists():
         labeled_text_masks = np.load(
@@ -268,6 +278,14 @@ def load_all_data(
         logger.info(f"  labeled_text_mask.npy: {labeled_text_masks.shape} [loaded]")
     else:
         logger.warning("  labeled_text_mask.npy is missing; falling back to no-mask mode.")
+
+    if (emb_dir / "labeled_concat_mask.npy").exists():
+        labeled_concat_masks = np.load(
+            emb_dir / "labeled_concat_mask.npy", mmap_mode="r"
+        )
+        logger.info(f"  labeled_concat_mask.npy: {labeled_concat_masks.shape} [loaded]")
+    else:
+        logger.warning("  labeled_concat_mask.npy is missing; falling back to no-mask mode.")
 
     if (emb_dir / "labeled_event_mask.npy").exists():
         labeled_event_masks = np.load(
@@ -318,6 +336,7 @@ def load_all_data(
                 fold_train_indices=train_indices,
                 fold_val_indices=val_indices,
                 labeled_text_masks=labeled_text_masks,
+                labeled_concat_masks=labeled_concat_masks,
                 labeled_event_masks=labeled_event_masks,
                 batch_size=batch_size,
             )
