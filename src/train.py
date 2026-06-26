@@ -79,7 +79,7 @@ def _evaluate_iece_metrics(
                 else event_padding_mask
             )
 
-            emotion_logits, cause_logits, center_logits = model(
+            emotion_logits, cause_logits, center_logits, alignment_logits = model(
                 text_emb=text_emb,
                 cause_input_emb=cause_input_emb,
                 text_padding_mask=text_padding_mask,
@@ -98,6 +98,7 @@ def _evaluate_iece_metrics(
                     cause_labels=cause_labels,
                     center_logits=center_logits,
                     center_labels=center_labels,
+                    alignment_logits=alignment_logits,
                 )
                 total_val_loss += float(loss.item())
                 n_batches += 1
@@ -415,7 +416,7 @@ def train(
                 else event_padding_mask
             )
 
-            emotion_logits, cause_logits, center_logits = model(
+            emotion_logits, cause_logits, center_logits, alignment_logits = model(
                 text_emb=text_emb,
                 cause_input_emb=cause_input_emb,
                 text_padding_mask=text_padding_mask,
@@ -433,6 +434,7 @@ def train(
                 cause_labels=cause_labels,
                 center_logits=center_logits,
                 center_labels=center_labels,
+                alignment_logits=alignment_logits,
             )
 
             optimizer.zero_grad()

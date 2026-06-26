@@ -110,6 +110,7 @@ class IMRLoss(nn.Module):
         emotion_weight: float = Config.LOSS_WEIGHT_EMOTION,
         cause_weight: float = Config.LOSS_WEIGHT_CAUSE,
         center_weight: float = Config.LOSS_WEIGHT_CENTER,
+        alignment_weight: float = Config.LOSS_WEIGHT_ALIGNMENT,
         cause_class_weights: Optional[torch.Tensor] = None,
     ):
         super().__init__()
@@ -138,6 +139,7 @@ class IMRLoss(nn.Module):
         self.emotion_weight = float(emotion_weight)
         self.cause_weight = float(cause_weight)
         self.center_weight = float(center_weight)
+        self.alignment_weight = float(alignment_weight)
 
     def forward(
         self,
@@ -147,6 +149,7 @@ class IMRLoss(nn.Module):
         cause_labels: torch.Tensor,
         center_logits: Optional[torch.Tensor] = None,
         center_labels: Optional[torch.Tensor] = None,
+        alignment_logits: Optional[torch.Tensor] = None,
     ):
         emotion_loss = self.emotion_ce(emotion_logits, emotion_labels)
         if self.cause_loss_type == "focal":
@@ -166,6 +169,16 @@ class IMRLoss(nn.Module):
                 label_smoothing=self.label_smoothing,
             )
             loss = loss + self.center_weight * center_loss
+        if (
+            self.alignment_weight > 0
+            and alignment_logits is not None
+            and Config.DL_USE_EMOTION_EVENT_ALIGNMENT
+        ):
+            alignment_loss = F.binary_cross_entropy_with_logits(
+                alignment_logits,
+                cause_labels.float(),
+            )
+            loss = loss + self.alignment_weight * alignment_loss
         return loss
 
     def _focal_cause_loss(
@@ -377,7 +390,7 @@ class EmotionConditionedState(nn.Module):
 
 
 class CauseEventPrior(nn.Module):
-    """Encode event position/count features as a weak center-event prior."""
+    """Encode structural and emotion-aware features as a center-event prior."""
 
     def __init__(self, d_model: int, dropout: float = 0.1, n_features: int = 4):
         super().__init__()
@@ -389,8 +402,18 @@ class CauseEventPrior(nn.Module):
             nn.GELU(),
             nn.Dropout(dropout),
         )
+        self.relation_encoder = nn.Sequential(
+            nn.Linear(d_model * 4, d_model),
+            nn.GELU(),
+            nn.Dropout(dropout),
+            nn.Linear(d_model, d_model),
+            nn.Dropout(dropout),
+        )
         self.center_head = nn.Sequential(
-            nn.Linear(d_model * 2, d_model // 2),
+            nn.Linear(d_model * 5, d_model),
+            nn.GELU(),
+            nn.Dropout(dropout),
+            nn.Linear(d_model, d_model // 2),
             nn.GELU(),
             nn.Dropout(dropout),
             nn.Linear(d_model // 2, 2),
@@ -400,11 +423,34 @@ class CauseEventPrior(nn.Module):
     def forward(
         self,
         cause_state: torch.Tensor,
+        emotion_state: torch.Tensor,
         event_features: torch.Tensor,
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        prior_state = self.feature_encoder(event_features)
-        center_logits = self.center_head(torch.cat([cause_state, prior_state], dim=-1))
-        return self.norm(cause_state + prior_state), center_logits
+        struct_state = self.feature_encoder(event_features)
+        relation_features = torch.cat(
+            [
+                cause_state,
+                emotion_state,
+                torch.abs(cause_state - emotion_state),
+                cause_state * emotion_state,
+            ],
+            dim=-1,
+        )
+        relation_state = self.relation_encoder(relation_features)
+        prior_state = self.norm(cause_state + struct_state + relation_state)
+        center_logits = self.center_head(
+            torch.cat(
+                [
+                    cause_state,
+                    emotion_state,
+                    prior_state,
+                    torch.abs(cause_state - emotion_state),
+                    cause_state * emotion_state,
+                ],
+                dim=-1,
+            )
+        )
+        return prior_state, center_logits
 
 
 class IMRModel(nn.Module):
@@ -517,6 +563,18 @@ class IMRModel(nn.Module):
         self.cause_from_emo_attn = CrossAttentionInteraction(d_model, dropout)
         self.cause_refinement = StateRefinementModule(d_model, dropout)
         self.cause_output_conditioner = EmotionConditionedState(d_model, dropout)
+        self.alignment_cause_proj = nn.Sequential(
+            nn.Linear(d_model, d_model),
+            nn.GELU(),
+            nn.Dropout(dropout),
+            nn.Linear(d_model, d_model),
+        )
+        self.alignment_emotion_proj = nn.Sequential(
+            nn.Linear(d_model, d_model),
+            nn.GELU(),
+            nn.Dropout(dropout),
+            nn.Linear(d_model, d_model),
+        )
 
         # ===== Stage 4: final prediction heads =====
         self.emotion_head = nn.Sequential(
@@ -571,6 +629,7 @@ class IMRModel(nn.Module):
         if Config.DL_USE_CENTER_EVENT_PRIOR and event_features is not None:
             prior_state, center_logits = self.cause_event_prior(
                 cause_state,
+                emo_state,
                 event_features.to(dtype=cause_state.dtype),
             )
             scale = float(Config.DL_CENTER_PRIOR_STATE_SCALE)
@@ -597,7 +656,8 @@ class IMRModel(nn.Module):
             if return_intermediate:
                 return emotion_logits, cause_logits, intermediates
             if return_auxiliary:
-                return emotion_logits, cause_logits, center_logits
+                alignment_logits = self._compute_alignment_logits(cause_state, emo_state)
+                return emotion_logits, cause_logits, center_logits, alignment_logits
             return emotion_logits, cause_logits
 
         # Variant 2: w/o Backward - keep only one-way Emotion -> Cause interaction.
@@ -618,7 +678,8 @@ class IMRModel(nn.Module):
             if return_intermediate:
                 return emotion_logits, cause_logits, intermediates
             if return_auxiliary:
-                return emotion_logits, cause_logits, center_logits
+                alignment_logits = self._compute_alignment_logits(cause_pred_state, emo_state)
+                return emotion_logits, cause_logits, center_logits, alignment_logits
             return emotion_logits, cause_logits
 
         # ===== Stage 3: T rounds of iterative interaction =====
@@ -650,7 +711,8 @@ class IMRModel(nn.Module):
         if return_intermediate:
             return emotion_logits, cause_logits, intermediates
         if return_auxiliary:
-            return emotion_logits, cause_logits, center_logits
+            alignment_logits = self._compute_alignment_logits(cause_pred_state, emo_state)
+            return emotion_logits, cause_logits, center_logits, alignment_logits
         return emotion_logits, cause_logits
 
     def _predict_cause_logits(
@@ -662,6 +724,18 @@ class IMRModel(nn.Module):
         if Config.DL_USE_CENTER_EVENT_PRIOR and center_logits is not None:
             cause_logits = cause_logits + float(Config.DL_CENTER_PRIOR_LOGIT_SCALE) * center_logits
         return cause_logits
+
+    def _compute_alignment_logits(
+        self,
+        cause_state: torch.Tensor,
+        emotion_state: torch.Tensor,
+    ) -> Optional[torch.Tensor]:
+        if not Config.DL_USE_EMOTION_EVENT_ALIGNMENT:
+            return None
+        cause_vec = F.normalize(self.alignment_cause_proj(cause_state), dim=-1)
+        emotion_vec = F.normalize(self.alignment_emotion_proj(emotion_state), dim=-1)
+        similarity = (cause_vec * emotion_vec).sum(dim=-1)
+        return similarity / max(float(Config.DL_ALIGNMENT_TEMPERATURE), 1e-6)
 
     def _encode_cause_view(
         self,
