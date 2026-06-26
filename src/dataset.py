@@ -40,12 +40,15 @@ class EventPair:
     emotion_label: int
     cause_label: int
     doc_id: str
+    event_index: int
+    event_count: int
 
     @classmethod
     def from_sample(cls, sample: IECESample) -> List["EventPair"]:
         emotion_label = Config.get_emotion_to_idx().get(sample.emotion_category, -1)
         pairs: List[EventPair] = []
-        for event in sample.events:
+        event_count = max(len(sample.events), 1)
+        for event_index, event in enumerate(sample.events):
             pairs.append(
                 cls(
                     text=sample.original_text,
@@ -53,6 +56,8 @@ class EventPair:
                     emotion_label=emotion_label,
                     cause_label=1 if event.cause == "Y" else 0,
                     doc_id=str(sample.sample_id),
+                    event_index=event_index,
+                    event_count=event_count,
                 )
             )
         return pairs
@@ -170,6 +175,11 @@ class IECEDataset(Dataset):
             ),
             "emotion_label": torch.tensor(pair.emotion_label, dtype=torch.long),
             "cause_label": torch.tensor(pair.cause_label, dtype=torch.long),
+            "center_label": torch.tensor(pair.cause_label, dtype=torch.long),
+            "event_features": torch.tensor(
+                _build_event_features(pair.event_index, pair.event_count),
+                dtype=torch.float32,
+            ),
             "text": pair.text,
             "event_text": pair.event_text,
             "doc_id": pair.doc_id,
@@ -188,6 +198,18 @@ class IECEDataset(Dataset):
                 self.event_masks[emb_idx].astype(bool)
             )
         return result
+
+
+def _build_event_features(event_index: int, event_count: int) -> List[float]:
+    """Lightweight center-event priors available without label leakage."""
+    count = max(int(event_count), 1)
+    index = min(max(int(event_index), 0), count - 1)
+    denom = max(count - 1, 1)
+    rel_pos = index / denom
+    from_start = index / count
+    from_end = (count - 1 - index) / count
+    log_count = float(np.log1p(count) / np.log1p(32.0))
+    return [rel_pos, from_start, from_end, log_count]
 
 
 def build_dataloaders(

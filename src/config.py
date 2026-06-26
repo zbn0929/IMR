@@ -85,6 +85,7 @@ class Config:
     DL_LABEL_SMOOTHING: float = 0.05  # Label smoothing.
     LOSS_WEIGHT_EMOTION: float = 1.0
     LOSS_WEIGHT_CAUSE: float = 1.0
+    LOSS_WEIGHT_CENTER: float = 0.2
     CAUSE_LOSS_TYPE: str = "focal"  # "ce" | "focal"
     CAUSE_FOCAL_GAMMA: float = 1.5
     # Cause labels are event-level and can drift by fold; "balanced" computes
@@ -114,6 +115,9 @@ class Config:
     # - "concat": text+event context branch
     # - "dual": v4 dual-view event/context gated cause branch
     DL_CAUSE_INPUT_MODE: str = "dual"
+    DL_USE_CENTER_EVENT_PRIOR: bool = True
+    DL_CENTER_PRIOR_STATE_SCALE: float = 0.35
+    DL_CENTER_PRIOR_LOGIT_SCALE: float = 0.15
 
     @classmethod
     def apply_dataset_type(cls, dataset_type: str | None = None):

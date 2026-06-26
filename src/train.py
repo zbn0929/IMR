@@ -55,6 +55,8 @@ def _evaluate_iece_metrics(
             event_emb = batch["event_emb"].to(device)
             emotion_labels = batch["emotion_label"].to(device)
             cause_labels = batch["cause_label"].to(device)
+            center_labels = batch["center_label"].to(device)
+            event_features = batch["event_features"].to(device)
 
             text_padding_mask = batch.get("key_padding_mask", None)
             if text_padding_mask is not None:
@@ -77,13 +79,15 @@ def _evaluate_iece_metrics(
                 else event_padding_mask
             )
 
-            emotion_logits, cause_logits = model(
+            emotion_logits, cause_logits, center_logits = model(
                 text_emb=text_emb,
                 cause_input_emb=cause_input_emb,
                 text_padding_mask=text_padding_mask,
                 cause_padding_mask=cause_padding_mask,
                 concat_input_emb=concat_emb,
                 concat_padding_mask=concat_padding_mask,
+                event_features=event_features,
+                return_auxiliary=True,
             )
 
             if loss_fn is not None:
@@ -92,6 +96,8 @@ def _evaluate_iece_metrics(
                     cause_logits=cause_logits,
                     emotion_labels=emotion_labels,
                     cause_labels=cause_labels,
+                    center_logits=center_logits,
+                    center_labels=center_labels,
                 )
                 total_val_loss += float(loss.item())
                 n_batches += 1
@@ -383,6 +389,8 @@ def train(
             event_emb = batch["event_emb"].to(device)
             emotion_labels = batch["emotion_label"].to(device)
             cause_labels = batch["cause_label"].to(device)
+            center_labels = batch["center_label"].to(device)
+            event_features = batch["event_features"].to(device)
 
             # Read padding masks.
             text_padding_mask = batch.get("key_padding_mask", None)
@@ -407,13 +415,15 @@ def train(
                 else event_padding_mask
             )
 
-            emotion_logits, cause_logits = model(
+            emotion_logits, cause_logits, center_logits = model(
                 text_emb=text_emb,
                 cause_input_emb=cause_input_emb,
                 text_padding_mask=text_padding_mask,
                 cause_padding_mask=cause_padding_mask,
                 concat_input_emb=concat_emb,
                 concat_padding_mask=concat_padding_mask,
+                event_features=event_features,
+                return_auxiliary=True,
             )
 
             loss = loss_fn(
@@ -421,6 +431,8 @@ def train(
                 cause_logits=cause_logits,
                 emotion_labels=emotion_labels,
                 cause_labels=cause_labels,
+                center_logits=center_logits,
+                center_labels=center_labels,
             )
 
             optimizer.zero_grad()
