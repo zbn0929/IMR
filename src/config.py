@@ -86,7 +86,7 @@ class Config:
     LOSS_WEIGHT_EMOTION: float = 1.0
     LOSS_WEIGHT_CAUSE: float = 1.0
     LOSS_WEIGHT_CENTER: float = 0.2
-    LOSS_WEIGHT_ALIGNMENT: float = 0.05
+    LOSS_WEIGHT_ALIGNMENT: float = 0.0
     CAUSE_LOSS_TYPE: str = "focal"  # "ce" | "focal"
     CAUSE_FOCAL_GAMMA: float = 1.5
     # Cause labels are event-level and can drift by fold; "balanced" computes
@@ -120,7 +120,11 @@ class Config:
     DL_CENTER_PRIOR_STATE_SCALE: float = 0.35
     DL_CENTER_PRIOR_LOGIT_SCALE: float = 0.15
     DL_USE_EMOTION_EVENT_ALIGNMENT: bool = True
-    DL_ALIGNMENT_TEMPERATURE: float = 0.2
+    DL_ALIGNMENT_TEMPERATURE: float = 0.35
+    DL_ALIGNMENT_GATE_SCALE: float = 0.2
+    DL_ALIGNMENT_LOGIT_SCALE: float = 0.08
+    DL_USE_RELATIVE_POSITION_PRIOR: bool = True
+    DL_POSITION_PRIOR_LOGIT_SCALE: float = 0.12
 
     @classmethod
     def apply_dataset_type(cls, dataset_type: str | None = None):

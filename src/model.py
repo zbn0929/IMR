@@ -389,6 +389,92 @@ class EmotionConditionedState(nn.Module):
         return self.norm(cause_state + conditioned)
 
 
+class EmotionEventAlignmentGate(nn.Module):
+    """Inject emotion-event agreement as a bounded feature gate."""
+
+    def __init__(self, d_model: int, dropout: float = 0.1, n_features: int = 4):
+        super().__init__()
+        self.cause_proj = nn.Sequential(
+            nn.Linear(d_model, d_model),
+            nn.GELU(),
+            nn.Dropout(dropout),
+            nn.Linear(d_model, d_model),
+        )
+        self.emotion_proj = nn.Sequential(
+            nn.Linear(d_model, d_model),
+            nn.GELU(),
+            nn.Dropout(dropout),
+            nn.Linear(d_model, d_model),
+        )
+        gate_dim = d_model * 4 + n_features + 1
+        self.gate = nn.Sequential(
+            nn.Linear(gate_dim, d_model),
+            nn.GELU(),
+            nn.Dropout(dropout),
+            nn.Linear(d_model, d_model),
+            nn.Sigmoid(),
+        )
+        self.update = nn.Sequential(
+            nn.Linear(d_model * 2, d_model),
+            nn.GELU(),
+            nn.Dropout(dropout),
+            nn.Linear(d_model, d_model),
+            nn.Dropout(dropout),
+        )
+        self.norm = nn.LayerNorm(d_model)
+        self.n_features = n_features
+
+    def forward(
+        self,
+        cause_state: torch.Tensor,
+        emotion_state: torch.Tensor,
+        event_features: Optional[torch.Tensor] = None,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        cause_vec = F.normalize(self.cause_proj(cause_state), dim=-1)
+        emotion_vec = F.normalize(self.emotion_proj(emotion_state), dim=-1)
+        similarity = (cause_vec * emotion_vec).sum(dim=-1, keepdim=True)
+        if event_features is None:
+            event_features = cause_state.new_zeros(cause_state.size(0), self.n_features)
+        else:
+            event_features = event_features.to(dtype=cause_state.dtype)
+        gate_input = torch.cat(
+            [
+                cause_state,
+                emotion_state,
+                torch.abs(cause_state - emotion_state),
+                cause_state * emotion_state,
+                event_features,
+                similarity,
+            ],
+            dim=-1,
+        )
+        gate = self.gate(gate_input)
+        update = self.update(torch.cat([cause_state, emotion_state], dim=-1))
+        scale = float(Config.DL_ALIGNMENT_GATE_SCALE)
+        aligned_state = self.norm(cause_state + scale * gate * update)
+        logits = similarity.squeeze(-1) / max(float(Config.DL_ALIGNMENT_TEMPERATURE), 1e-6)
+        return aligned_state, logits
+
+
+class RelativePositionPrior(nn.Module):
+    """Small structural logit bias from event order features."""
+
+    def __init__(self, d_model: int, dropout: float = 0.1, n_features: int = 4):
+        super().__init__()
+        self.logit_head = nn.Sequential(
+            nn.Linear(n_features, d_model // 2),
+            nn.GELU(),
+            nn.Dropout(dropout),
+            nn.Linear(d_model // 2, d_model // 4),
+            nn.GELU(),
+            nn.Dropout(dropout),
+            nn.Linear(d_model // 4, 2),
+        )
+
+    def forward(self, event_features: torch.Tensor) -> torch.Tensor:
+        return self.logit_head(event_features)
+
+
 class CauseEventPrior(nn.Module):
     """Encode structural and emotion-aware features as a center-event prior."""
 
@@ -553,6 +639,8 @@ class IMRModel(nn.Module):
         self.cause_context_attn_pool = AttentionPool(d_model)
         self.cause_state_fusion = StateFusionGate(d_model, dropout)
         self.cause_event_prior = CauseEventPrior(d_model, dropout)
+        self.alignment_gate = EmotionEventAlignmentGate(d_model, dropout)
+        self.relative_position_prior = RelativePositionPrior(d_model, dropout)
 
         # ===== Stage 3: iterative interaction modules =====
         # Emotion update: gather clues from Cause.
@@ -563,18 +651,6 @@ class IMRModel(nn.Module):
         self.cause_from_emo_attn = CrossAttentionInteraction(d_model, dropout)
         self.cause_refinement = StateRefinementModule(d_model, dropout)
         self.cause_output_conditioner = EmotionConditionedState(d_model, dropout)
-        self.alignment_cause_proj = nn.Sequential(
-            nn.Linear(d_model, d_model),
-            nn.GELU(),
-            nn.Dropout(dropout),
-            nn.Linear(d_model, d_model),
-        )
-        self.alignment_emotion_proj = nn.Sequential(
-            nn.Linear(d_model, d_model),
-            nn.GELU(),
-            nn.Dropout(dropout),
-            nn.Linear(d_model, d_model),
-        )
 
         # ===== Stage 4: final prediction heads =====
         self.emotion_head = nn.Sequential(
@@ -651,12 +727,21 @@ class IMRModel(nn.Module):
         # Variant 1: w/o IMR - both tasks are independent, with no interaction.
         if self.ablation_mode == "wo_imr":
             emotion_logits = self.emotion_head(emo_state)  # (B, num_emotions)
-            cause_logits = self._predict_cause_logits(cause_state, center_logits)
+            cause_pred_state, alignment_logits = self._apply_alignment_gate(
+                cause_state,
+                emo_state,
+                event_features,
+            )
+            cause_logits = self._predict_cause_logits(
+                cause_pred_state,
+                center_logits,
+                event_features,
+                alignment_logits,
+            )
             _record(0, emo_state, cause_state)
             if return_intermediate:
                 return emotion_logits, cause_logits, intermediates
             if return_auxiliary:
-                alignment_logits = self._compute_alignment_logits(cause_state, emo_state)
                 return emotion_logits, cause_logits, center_logits, alignment_logits
             return emotion_logits, cause_logits
 
@@ -674,11 +759,20 @@ class IMRModel(nn.Module):
 
             emotion_logits = self.emotion_head(emo_state)  # (B, num_emotions)
             cause_pred_state = self.cause_output_conditioner(cause_state, emo_state)
-            cause_logits = self._predict_cause_logits(cause_pred_state, center_logits)
+            cause_pred_state, alignment_logits = self._apply_alignment_gate(
+                cause_pred_state,
+                emo_state,
+                event_features,
+            )
+            cause_logits = self._predict_cause_logits(
+                cause_pred_state,
+                center_logits,
+                event_features,
+                alignment_logits,
+            )
             if return_intermediate:
                 return emotion_logits, cause_logits, intermediates
             if return_auxiliary:
-                alignment_logits = self._compute_alignment_logits(cause_pred_state, emo_state)
                 return emotion_logits, cause_logits, center_logits, alignment_logits
             return emotion_logits, cause_logits
 
@@ -706,12 +800,21 @@ class IMRModel(nn.Module):
         # ===== Stage 4: final prediction =====
         emotion_logits = self.emotion_head(emo_state)  # (B, 7)
         cause_pred_state = self.cause_output_conditioner(cause_state, emo_state)
-        cause_logits = self._predict_cause_logits(cause_pred_state, center_logits)
+        cause_pred_state, alignment_logits = self._apply_alignment_gate(
+            cause_pred_state,
+            emo_state,
+            event_features,
+        )
+        cause_logits = self._predict_cause_logits(
+            cause_pred_state,
+            center_logits,
+            event_features,
+            alignment_logits,
+        )
 
         if return_intermediate:
             return emotion_logits, cause_logits, intermediates
         if return_auxiliary:
-            alignment_logits = self._compute_alignment_logits(cause_pred_state, emo_state)
             return emotion_logits, cause_logits, center_logits, alignment_logits
         return emotion_logits, cause_logits
 
@@ -719,23 +822,41 @@ class IMRModel(nn.Module):
         self,
         cause_state: torch.Tensor,
         center_logits: Optional[torch.Tensor],
+        event_features: Optional[torch.Tensor] = None,
+        alignment_logits: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         cause_logits = self.cause_head(cause_state)
         if Config.DL_USE_CENTER_EVENT_PRIOR and center_logits is not None:
             cause_logits = cause_logits + float(Config.DL_CENTER_PRIOR_LOGIT_SCALE) * center_logits
+        if Config.DL_USE_RELATIVE_POSITION_PRIOR and event_features is not None:
+            position_logits = self.relative_position_prior(
+                event_features.to(dtype=cause_state.dtype)
+            )
+            cause_logits = (
+                cause_logits
+                + float(Config.DL_POSITION_PRIOR_LOGIT_SCALE) * position_logits
+            )
+        if (
+            Config.DL_USE_EMOTION_EVENT_ALIGNMENT
+            and alignment_logits is not None
+            and Config.DL_ALIGNMENT_LOGIT_SCALE != 0
+        ):
+            alignment_bias = torch.stack([-alignment_logits, alignment_logits], dim=-1)
+            cause_logits = (
+                cause_logits
+                + float(Config.DL_ALIGNMENT_LOGIT_SCALE) * alignment_bias
+            )
         return cause_logits
 
-    def _compute_alignment_logits(
+    def _apply_alignment_gate(
         self,
         cause_state: torch.Tensor,
         emotion_state: torch.Tensor,
-    ) -> Optional[torch.Tensor]:
+        event_features: Optional[torch.Tensor],
+    ) -> tuple[torch.Tensor, Optional[torch.Tensor]]:
         if not Config.DL_USE_EMOTION_EVENT_ALIGNMENT:
-            return None
-        cause_vec = F.normalize(self.alignment_cause_proj(cause_state), dim=-1)
-        emotion_vec = F.normalize(self.alignment_emotion_proj(emotion_state), dim=-1)
-        similarity = (cause_vec * emotion_vec).sum(dim=-1)
-        return similarity / max(float(Config.DL_ALIGNMENT_TEMPERATURE), 1e-6)
+            return cause_state, None
+        return self.alignment_gate(cause_state, emotion_state, event_features)
 
     def _encode_cause_view(
         self,
