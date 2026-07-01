@@ -111,10 +111,10 @@ class Config:
     # False: use concat_emb, encoded from text and event together as in v2.
     DL_USE_EVENT_EMB: bool = True  # Enable task-aligned event-specific embeddings.
     # Cause input mode:
-    # - "event": event-only cause branch, compatible with the old v3 model
+    # - "event": single event-only cause branch, compatible with the old v3 model
     # - "concat": text+event context branch
     # - "dual": v4 dual-view event/context gated cause branch
-    DL_CAUSE_INPUT_MODE: str = "dual"
+    DL_CAUSE_INPUT_MODE: str = "event"
     DL_USE_CENTER_EVENT_PRIOR: bool = True
     DL_CENTER_PRIOR_STATE_SCALE: float = 0.35
     DL_CENTER_PRIOR_LOGIT_SCALE: float = 0.15
