@@ -114,7 +114,7 @@ class Config:
     # - "event": single event-only cause branch, compatible with the old v3 model
     # - "concat": text+event context branch
     # - "dual": v4 dual-view event/context gated cause branch
-    DL_CAUSE_INPUT_MODE: str = "event"
+    DL_CAUSE_INPUT_MODE: str = "dual"
     DL_USE_CENTER_EVENT_PRIOR: bool = True
     DL_CENTER_PRIOR_STATE_SCALE: float = 0.35
     DL_CENTER_PRIOR_LOGIT_SCALE: float = 0.15
