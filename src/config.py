@@ -86,15 +86,12 @@ class Config:
     LOSS_WEIGHT_EMOTION: float = 1.0
     LOSS_WEIGHT_CAUSE: float = 1.0
     LOSS_WEIGHT_CENTER: float = 0.2
-    LOSS_WEIGHT_RANKING: float = 0.1
     CAUSE_LOSS_TYPE: str = "focal"  # "ce" | "focal"
     CAUSE_FOCAL_GAMMA: float = 1.5
-    CAUSE_RANKING_MARGIN: float = 0.2
-    DL_GROUP_EVENTS_BY_DOC: bool = True
     # Cause labels are event-level and can drift by fold; "balanced" computes
     # inverse-frequency class weights from each training fold.
     CAUSE_CLASS_WEIGHT_MODE: str = "balanced"  # "none" | "balanced"
-    DL_TUNE_DECISION_THRESHOLD: bool = True
+    DL_TUNE_DECISION_THRESHOLD: bool = False
     DL_THRESHOLD_MIN: float = 0.05
     DL_THRESHOLD_MAX: float = 0.95
     DL_THRESHOLD_STEPS: int = 181
@@ -114,7 +111,7 @@ class Config:
     # False: use concat_emb, encoded from text and event together as in v2.
     DL_USE_EVENT_EMB: bool = True  # Enable task-aligned event-specific embeddings.
     # Cause input mode:
-    # - "event": single event-only cause branch, compatible with the old v3 model
+    # - "event": event-only cause branch, compatible with the old v3 model
     # - "concat": text+event context branch
     # - "dual": v4 dual-view event/context gated cause branch
     DL_CAUSE_INPUT_MODE: str = "dual"
