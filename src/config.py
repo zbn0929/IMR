@@ -86,8 +86,11 @@ class Config:
     LOSS_WEIGHT_EMOTION: float = 1.0
     LOSS_WEIGHT_CAUSE: float = 1.0
     LOSS_WEIGHT_CENTER: float = 0.2
+    LOSS_WEIGHT_RANKING: float = 0.1
     CAUSE_LOSS_TYPE: str = "focal"  # "ce" | "focal"
     CAUSE_FOCAL_GAMMA: float = 1.5
+    CAUSE_RANKING_MARGIN: float = 0.2
+    DL_GROUP_EVENTS_BY_DOC: bool = True
     # Cause labels are event-level and can drift by fold; "balanced" computes
     # inverse-frequency class weights from each training fold.
     CAUSE_CLASS_WEIGHT_MODE: str = "balanced"  # "none" | "balanced"

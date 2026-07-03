@@ -151,6 +151,43 @@ def _find_best_threshold(probs: List[float], labels: List[int]) -> float:
     return best_threshold
 
 
+def _document_ranking_loss(
+    cause_logits: torch.Tensor,
+    cause_labels: torch.Tensor,
+    doc_ids: List[str],
+) -> torch.Tensor:
+    """Rank cause events above non-cause events from the same document."""
+    if float(Config.LOSS_WEIGHT_RANKING) <= 0:
+        return cause_logits.new_zeros(())
+
+    scores = cause_logits[:, 1] - cause_logits[:, 0]
+    losses: List[torch.Tensor] = []
+    for doc_id in sorted(set(doc_ids)):
+        indices = [
+            idx
+            for idx, item_doc_id in enumerate(doc_ids)
+            if item_doc_id == doc_id
+        ]
+        if len(indices) < 2:
+            continue
+        doc_indices = torch.as_tensor(indices, device=cause_logits.device)
+        doc_labels = cause_labels.index_select(0, doc_indices)
+        doc_scores = scores.index_select(0, doc_indices)
+        pos_scores = doc_scores[doc_labels == 1]
+        neg_scores = doc_scores[doc_labels == 0]
+        if pos_scores.numel() == 0 or neg_scores.numel() == 0:
+            continue
+        pairwise_loss = torch.relu(
+            float(Config.CAUSE_RANKING_MARGIN)
+            - (pos_scores[:, None] - neg_scores[None, :])
+        )
+        losses.append(pairwise_loss.mean())
+
+    if not losses:
+        return cause_logits.new_zeros(())
+    return torch.stack(losses).mean()
+
+
 def _get_cause_class_weights(
     train_loader: DataLoader,
     device: torch.device,
@@ -434,6 +471,12 @@ def train(
                 center_logits=center_logits,
                 center_labels=center_labels,
             )
+            ranking_loss = _document_ranking_loss(
+                cause_logits=cause_logits,
+                cause_labels=cause_labels,
+                doc_ids=list(batch["doc_id"]),
+            )
+            loss = loss + float(Config.LOSS_WEIGHT_RANKING) * ranking_loss
 
             optimizer.zero_grad()
             loss.backward()

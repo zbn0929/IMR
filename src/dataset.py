@@ -10,6 +10,7 @@ precomputed by src.prepare_embeddings and loaded lazily with numpy mmap.
 from __future__ import annotations
 
 import sys
+import random
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -18,12 +19,12 @@ sys.path.insert(0, str(project_root))
 
 import logging
 from collections import Counter
-from typing import List, Optional, Tuple
+from typing import Iterator, List, Optional, Tuple
 
 import numpy as np
 import torch
 from sklearn.model_selection import StratifiedKFold
-from torch.utils.data import DataLoader, Dataset
+from torch.utils.data import DataLoader, Dataset, Sampler
 
 from data.iece_data_loader import IECEDataLoader, IECESample
 from src.config import Config
@@ -200,6 +201,65 @@ class IECEDataset(Dataset):
         return result
 
 
+class DocumentBatchSampler(Sampler[List[int]]):
+    """Yield batches that keep events from the same document together."""
+
+    def __init__(
+        self,
+        pairs: List[EventPair],
+        batch_size: int,
+        shuffle: bool = True,
+        seed: int = Config.RANDOM,
+    ):
+        self.batch_size = max(int(batch_size), 1)
+        self.shuffle = shuffle
+        self.seed = seed
+        self.epoch = 0
+
+        doc_to_indices: dict[str, List[int]] = {}
+        for idx, pair in enumerate(pairs):
+            doc_to_indices.setdefault(pair.doc_id, []).append(idx)
+        self.doc_groups = list(doc_to_indices.values())
+
+    def __iter__(self) -> Iterator[List[int]]:
+        groups = list(self.doc_groups)
+        if self.shuffle:
+            rng = random.Random(self.seed + self.epoch)
+            rng.shuffle(groups)
+            self.epoch += 1
+
+        batch: List[int] = []
+        for group in groups:
+            if batch and len(batch) + len(group) > self.batch_size:
+                yield batch
+                batch = []
+            if len(group) > self.batch_size:
+                yield from (
+                    group[start : start + self.batch_size]
+                    for start in range(0, len(group), self.batch_size)
+                )
+                continue
+            batch.extend(group)
+        if batch:
+            yield batch
+
+    def __len__(self) -> int:
+        n_batches = 0
+        batch_len = 0
+        for group in self.doc_groups:
+            group_len = len(group)
+            if batch_len and batch_len + group_len > self.batch_size:
+                n_batches += 1
+                batch_len = 0
+            if group_len > self.batch_size:
+                n_batches += (group_len + self.batch_size - 1) // self.batch_size
+            else:
+                batch_len += group_len
+        if batch_len:
+            n_batches += 1
+        return n_batches
+
+
 def _build_event_features(event_index: int, event_count: int) -> List[float]:
     """Lightweight center-event priors available without label leakage."""
     count = max(int(event_count), 1)
@@ -248,14 +308,26 @@ def build_dataloaders(
         event_masks=labeled_event_masks,
     )
 
-    train_loader = DataLoader(
-        train_dataset,
-        batch_size=batch_size,
-        shuffle=True,
-        drop_last=False,
-        num_workers=num_workers,
-        pin_memory=torch.cuda.is_available(),
-    )
+    if Config.DL_GROUP_EVENTS_BY_DOC:
+        train_loader = DataLoader(
+            train_dataset,
+            batch_sampler=DocumentBatchSampler(
+                train_dataset.pairs,
+                batch_size=batch_size,
+                shuffle=True,
+            ),
+            num_workers=num_workers,
+            pin_memory=torch.cuda.is_available(),
+        )
+    else:
+        train_loader = DataLoader(
+            train_dataset,
+            batch_size=batch_size,
+            shuffle=True,
+            drop_last=False,
+            num_workers=num_workers,
+            pin_memory=torch.cuda.is_available(),
+        )
     val_loader = DataLoader(
         val_dataset,
         batch_size=batch_size,
