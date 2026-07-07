@@ -57,6 +57,9 @@ def _evaluate_iece_metrics(
             cause_labels = batch["cause_label"].to(device)
             center_labels = batch["center_label"].to(device)
             event_features = batch["event_features"].to(device)
+            role_features = batch["role_features"].to(device)
+            event_indices = batch["event_index"].to(device)
+            doc_ids = batch.get("doc_id", None)
 
             text_padding_mask = batch.get("key_padding_mask", None)
             if text_padding_mask is not None:
@@ -87,6 +90,9 @@ def _evaluate_iece_metrics(
                 concat_input_emb=concat_emb,
                 concat_padding_mask=concat_padding_mask,
                 event_features=event_features,
+                role_features=role_features,
+                doc_ids=doc_ids,
+                event_indices=event_indices,
                 return_auxiliary=True,
             )
 
@@ -225,7 +231,14 @@ def configure_optimizer(
             ("emotion_proj", "emotion_encoder", "emotion_attn_pool", "emotion_head")
         ):
             emotion_params.append(param)
-        elif name.startswith("cause_"):
+        elif name.startswith(
+            (
+                "cause_",
+                "role_event_encoder",
+                "event_set_reasoner",
+                "sgmr_refinement",
+            )
+        ):
             cause_params.append(param)
         else:
             shared_params.append(param)
@@ -391,6 +404,9 @@ def train(
             cause_labels = batch["cause_label"].to(device)
             center_labels = batch["center_label"].to(device)
             event_features = batch["event_features"].to(device)
+            role_features = batch["role_features"].to(device)
+            event_indices = batch["event_index"].to(device)
+            doc_ids = batch.get("doc_id", None)
 
             # Read padding masks.
             text_padding_mask = batch.get("key_padding_mask", None)
@@ -423,6 +439,9 @@ def train(
                 concat_input_emb=concat_emb,
                 concat_padding_mask=concat_padding_mask,
                 event_features=event_features,
+                role_features=role_features,
+                doc_ids=doc_ids,
+                event_indices=event_indices,
                 return_auxiliary=True,
             )
 

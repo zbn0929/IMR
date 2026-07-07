@@ -407,6 +407,214 @@ class CauseEventPrior(nn.Module):
         return self.norm(cause_state + prior_state), center_logits
 
 
+class RoleAwareEventEncoder(nn.Module):
+    """Inject seven-tuple role structure into an event state."""
+
+    def __init__(self, d_model: int, n_roles: int = Config.DL_ROLE_COUNT, dropout: float = 0.1):
+        super().__init__()
+        self.role_embedding = nn.Parameter(torch.empty(n_roles, d_model))
+        nn.init.normal_(self.role_embedding, mean=0.0, std=0.02)
+        self.role_value_proj = nn.Linear(1, d_model)
+        self.role_score = nn.Sequential(
+            nn.Linear(d_model, d_model // 2),
+            nn.Tanh(),
+            nn.Dropout(dropout),
+            nn.Linear(d_model // 2, 1),
+        )
+        self.output = nn.Sequential(
+            nn.Linear(d_model * 2, d_model),
+            nn.GELU(),
+            nn.Dropout(dropout),
+            nn.Linear(d_model, d_model),
+            nn.Dropout(dropout),
+        )
+        self.norm = nn.LayerNorm(d_model)
+
+    def forward(
+        self,
+        event_state: torch.Tensor,
+        role_features: Optional[torch.Tensor],
+    ) -> torch.Tensor:
+        if role_features is None:
+            return event_state
+
+        role_features = role_features.to(dtype=event_state.dtype, device=event_state.device)
+        role_states = (
+            event_state.unsqueeze(1)
+            + self.role_embedding.unsqueeze(0)
+            + self.role_value_proj(role_features.unsqueeze(-1))
+        )
+        scores = self.role_score(role_states).squeeze(-1)
+        weights = torch.softmax(scores, dim=-1)
+        role_context = (role_states * weights.unsqueeze(-1)).sum(dim=1)
+        update = self.output(torch.cat([event_state, role_context], dim=-1))
+        return self.norm(event_state + update)
+
+
+class EventSetReasoner(nn.Module):
+    """Contextualize candidate events within each document."""
+
+    def __init__(
+        self,
+        d_model: int,
+        nhead: int,
+        dim_feedforward: int,
+        n_layers: int = Config.DL_EVENT_SET_LAYERS,
+        dropout: float = 0.1,
+    ):
+        super().__init__()
+        self.position_proj = nn.Linear(4, d_model)
+        encoder_layer = nn.TransformerEncoderLayer(
+            d_model=d_model,
+            nhead=nhead,
+            dim_feedforward=dim_feedforward,
+            dropout=dropout,
+            batch_first=True,
+            norm_first=True,
+        )
+        self.transformer = nn.TransformerEncoder(encoder_layer, num_layers=n_layers)
+        self.norm = nn.LayerNorm(d_model)
+
+    def forward(
+        self,
+        event_states: torch.Tensor,
+        event_features: Optional[torch.Tensor],
+        doc_ids: Optional[List[str]],
+        event_indices: Optional[torch.Tensor],
+    ) -> torch.Tensor:
+        if doc_ids is None or event_indices is None or event_states.size(0) <= 1:
+            return event_states
+
+        output = event_states.clone()
+        device = event_states.device
+        groups: Dict[str, List[int]] = {}
+        for idx, doc_id in enumerate(doc_ids):
+            groups.setdefault(str(doc_id), []).append(idx)
+
+        if event_features is None:
+            pos_state = torch.zeros_like(event_states)
+        else:
+            pos_state = self.position_proj(
+                event_features.to(dtype=event_states.dtype, device=device)
+            )
+
+        for indices in groups.values():
+            if len(indices) <= 1:
+                continue
+            sorted_indices = sorted(indices, key=lambda i: int(event_indices[i].item()))
+            idx_tensor = torch.tensor(sorted_indices, device=device, dtype=torch.long)
+            seq = event_states.index_select(0, idx_tensor) + pos_state.index_select(0, idx_tensor)
+            contextual = self.transformer(seq.unsqueeze(0)).squeeze(0)
+            output.index_copy_(0, idx_tensor, contextual)
+
+        return self.norm(event_states + output)
+
+
+class SelectiveGatedMutualRefinement(nn.Module):
+    """RSGMR selective gated bidirectional refinement."""
+
+    def __init__(self, d_model: int, dropout: float = 0.1):
+        super().__init__()
+        self.event_relevance = nn.Sequential(
+            nn.Linear(d_model * 2, d_model),
+            nn.GELU(),
+            nn.Dropout(dropout),
+            nn.Linear(d_model, 1),
+            nn.Sigmoid(),
+        )
+        self.event_to_emo_attn = nn.MultiheadAttention(
+            embed_dim=d_model,
+            num_heads=4,
+            dropout=dropout,
+            batch_first=True,
+        )
+        self.emo_gate = nn.Sequential(
+            nn.Linear(d_model * 3, d_model),
+            nn.GELU(),
+            nn.Dropout(dropout),
+            nn.Linear(d_model, d_model),
+            nn.Sigmoid(),
+        )
+        self.emo_update = nn.Sequential(
+            nn.Linear(d_model * 2, d_model * 2),
+            nn.GELU(),
+            nn.Dropout(dropout),
+            nn.Linear(d_model * 2, d_model),
+            nn.Dropout(dropout),
+        )
+        self.cause_from_text_attn = nn.MultiheadAttention(
+            embed_dim=d_model,
+            num_heads=4,
+            dropout=dropout,
+            batch_first=True,
+        )
+        self.cause_gate = nn.Sequential(
+            nn.Linear(d_model * 3, d_model),
+            nn.GELU(),
+            nn.Dropout(dropout),
+            nn.Linear(d_model, d_model),
+            nn.Sigmoid(),
+        )
+        self.cause_update = nn.Sequential(
+            nn.Linear(d_model * 3, d_model * 2),
+            nn.GELU(),
+            nn.Dropout(dropout),
+            nn.Linear(d_model * 2, d_model),
+            nn.Dropout(dropout),
+        )
+        self.emo_norm = nn.LayerNorm(d_model)
+        self.cause_norm = nn.LayerNorm(d_model)
+
+    def forward(
+        self,
+        emo_state: torch.Tensor,
+        event_states: torch.Tensor,
+        emotion_feats: torch.Tensor,
+        text_padding_mask: Optional[torch.Tensor],
+        doc_ids: Optional[List[str]],
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        if doc_ids is None:
+            doc_ids = [str(i) for i in range(event_states.size(0))]
+
+        groups: Dict[str, List[int]] = {}
+        for idx, doc_id in enumerate(doc_ids):
+            groups.setdefault(str(doc_id), []).append(idx)
+
+        updated_emo = emo_state.clone()
+        relevance_scale = float(Config.DL_SGMR_RELEVANCE_SCALE)
+        for indices in groups.values():
+            idx_tensor = torch.tensor(indices, device=event_states.device, dtype=torch.long)
+            doc_emo = emo_state[idx_tensor[0]].unsqueeze(0)
+            doc_events = event_states.index_select(0, idx_tensor)
+            emo_expanded = doc_emo.expand_as(doc_events)
+            relevance = self.event_relevance(torch.cat([doc_events, emo_expanded], dim=-1))
+            selected_events = doc_events * (relevance * relevance_scale)
+            context, _ = self.event_to_emo_attn(
+                query=doc_emo.unsqueeze(1),
+                key=selected_events.unsqueeze(0),
+                value=selected_events.unsqueeze(0),
+            )
+            context = context.squeeze(1)
+            gate_input = torch.cat([doc_emo, context, doc_emo * context], dim=-1)
+            gate = self.emo_gate(gate_input)
+            delta = self.emo_update(torch.cat([doc_emo, context], dim=-1))
+            doc_updated = self.emo_norm(doc_emo + gate * delta)
+            updated_emo.index_copy_(0, idx_tensor, doc_updated.expand(len(indices), -1))
+
+        cause_context, _ = self.cause_from_text_attn(
+            query=event_states.unsqueeze(1),
+            key=emotion_feats,
+            value=emotion_feats,
+            key_padding_mask=text_padding_mask,
+        )
+        cause_context = cause_context.squeeze(1)
+        cause_input = torch.cat([event_states, cause_context, updated_emo], dim=-1)
+        cause_gate = self.cause_gate(cause_input)
+        cause_delta = self.cause_update(cause_input)
+        updated_events = self.cause_norm(event_states + cause_gate * cause_delta)
+        return updated_emo, updated_events
+
+
 class IMRModel(nn.Module):
     """
     IMR (Iterative Mutual Refinement) model v3.
@@ -507,6 +715,14 @@ class IMRModel(nn.Module):
         self.cause_context_attn_pool = AttentionPool(d_model)
         self.cause_state_fusion = StateFusionGate(d_model, dropout)
         self.cause_event_prior = CauseEventPrior(d_model, dropout)
+        self.role_event_encoder = RoleAwareEventEncoder(d_model, Config.DL_ROLE_COUNT, dropout)
+        self.event_set_reasoner = EventSetReasoner(
+            d_model=d_model,
+            nhead=nhead,
+            dim_feedforward=dim_feedforward,
+            n_layers=Config.DL_EVENT_SET_LAYERS,
+            dropout=dropout,
+        )
 
         # ===== Stage 3: iterative interaction modules =====
         # Emotion update: gather clues from Cause.
@@ -516,6 +732,7 @@ class IMRModel(nn.Module):
         # Cause update: gather emotion priors from Emotion.
         self.cause_from_emo_attn = CrossAttentionInteraction(d_model, dropout)
         self.cause_refinement = StateRefinementModule(d_model, dropout)
+        self.sgmr_refinement = SelectiveGatedMutualRefinement(d_model, dropout)
         self.cause_output_conditioner = EmotionConditionedState(d_model, dropout)
 
         # ===== Stage 4: final prediction heads =====
@@ -544,6 +761,9 @@ class IMRModel(nn.Module):
         concat_input_emb: Optional[torch.Tensor] = None,  # (B, L, H) concat_emb
         concat_padding_mask: Optional[torch.Tensor] = None,  # (B, L) True=padding
         event_features: Optional[torch.Tensor] = None,  # (B, 4) structural features
+        role_features: Optional[torch.Tensor] = None,  # (B, 7) seven-tuple role features
+        doc_ids: Optional[List[str]] = None,
+        event_indices: Optional[torch.Tensor] = None,
         return_intermediate: bool = False,
         return_auxiliary: bool = False,
     ):
@@ -568,6 +788,17 @@ class IMRModel(nn.Module):
         # ===== Stage 2: initial states =====
         emo_state = self.emotion_attn_pool(emotion_feats, text_padding_mask)  # (B, d)
         center_logits = None
+        if Config.DL_USE_RSGMR and Config.DL_USE_ROLE_AWARE_EVENT:
+            cause_state = self.role_event_encoder(cause_state, role_features)
+
+        if Config.DL_USE_RSGMR and Config.DL_USE_EVENT_SET_REASONING:
+            cause_state = self.event_set_reasoner(
+                event_states=cause_state,
+                event_features=event_features,
+                doc_ids=doc_ids,
+                event_indices=event_indices,
+            )
+
         if Config.DL_USE_CENTER_EVENT_PRIOR and event_features is not None:
             prior_state, center_logits = self.cause_event_prior(
                 cause_state,
@@ -623,23 +854,32 @@ class IMRModel(nn.Module):
 
         # ===== Stage 3: T rounds of iterative interaction =====
         for i in range(self.n_iterations):
-            # 1. Emotion update: gather clues from Cause.
-            emo_ctx = self.emo_from_cause_attn(
-                query_state=emo_state,
-                kv_sequence=cause_feats,
-                kv_state=cause_state,
-                kv_padding_mask=cause_padding_mask,
-            )  # (B, d)
-            emo_state = self.emo_refinement(emo_state, emo_ctx)  # (B, d)
+            if Config.DL_USE_RSGMR and Config.DL_USE_SELECTIVE_GATED_REFINEMENT:
+                emo_state, cause_state = self.sgmr_refinement(
+                    emo_state=emo_state,
+                    event_states=cause_state,
+                    emotion_feats=emotion_feats,
+                    text_padding_mask=text_padding_mask,
+                    doc_ids=doc_ids,
+                )
+            else:
+                # 1. Emotion update: gather clues from Cause.
+                emo_ctx = self.emo_from_cause_attn(
+                    query_state=emo_state,
+                    kv_sequence=cause_feats,
+                    kv_state=cause_state,
+                    kv_padding_mask=cause_padding_mask,
+                )  # (B, d)
+                emo_state = self.emo_refinement(emo_state, emo_ctx)  # (B, d)
 
-            # 2. Cause update: gather emotion priors from Emotion.
-            cause_ctx = self.cause_from_emo_attn(
-                query_state=cause_state,
-                kv_sequence=emotion_feats,
-                kv_state=emo_state,  # Use the just-updated emotion state.
-                kv_padding_mask=text_padding_mask,
-            )  # (B, d)
-            cause_state = self.cause_refinement(cause_state, cause_ctx)  # (B, d)
+                # 2. Cause update: gather emotion priors from Emotion.
+                cause_ctx = self.cause_from_emo_attn(
+                    query_state=cause_state,
+                    kv_sequence=emotion_feats,
+                    kv_state=emo_state,  # Use the just-updated emotion state.
+                    kv_padding_mask=text_padding_mask,
+                )  # (B, d)
+                cause_state = self.cause_refinement(cause_state, cause_ctx)  # (B, d)
             _record(i + 1, emo_state, cause_state)
 
         # ===== Stage 4: final prediction =====

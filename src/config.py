@@ -119,6 +119,16 @@ class Config:
     DL_CENTER_PRIOR_STATE_SCALE: float = 0.35
     DL_CENTER_PRIOR_LOGIT_SCALE: float = 0.15
 
+    # --- RSGMR-IECE extensions from the technical design document ---
+    # Role-aware Event Set Reasoning and Selective Gated Mutual Refinement.
+    DL_USE_RSGMR: bool = True
+    DL_USE_ROLE_AWARE_EVENT: bool = True
+    DL_USE_EVENT_SET_REASONING: bool = True
+    DL_USE_SELECTIVE_GATED_REFINEMENT: bool = True
+    DL_ROLE_COUNT: int = 7
+    DL_EVENT_SET_LAYERS: int = 1
+    DL_SGMR_RELEVANCE_SCALE: float = 1.0
+
     @classmethod
     def apply_dataset_type(cls, dataset_type: str | None = None):
         """Keep the runtime fixed to the IECE paper-demo dataset."""

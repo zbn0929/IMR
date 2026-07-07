@@ -18,12 +18,13 @@ sys.path.insert(0, str(project_root))
 
 import logging
 from collections import Counter
-from typing import List, Optional, Tuple
+import random
+from typing import Iterator, List, Optional, Tuple
 
 import numpy as np
 import torch
 from sklearn.model_selection import StratifiedKFold
-from torch.utils.data import DataLoader, Dataset
+from torch.utils.data import DataLoader, Dataset, Sampler
 
 from data.iece_data_loader import IECEDataLoader, IECESample
 from src.config import Config
@@ -37,6 +38,7 @@ class EventPair:
 
     text: str
     event_text: str
+    role_values: Tuple[str, ...]
     emotion_label: int
     cause_label: int
     doc_id: str
@@ -53,6 +55,7 @@ class EventPair:
                 cls(
                     text=sample.original_text,
                     event_text=event.event_text,
+                    role_values=_extract_role_values(event.event_structure),
                     emotion_label=emotion_label,
                     cause_label=1 if event.cause == "Y" else 0,
                     doc_id=str(sample.sample_id),
@@ -180,6 +183,12 @@ class IECEDataset(Dataset):
                 _build_event_features(pair.event_index, pair.event_count),
                 dtype=torch.float32,
             ),
+            "role_features": torch.tensor(
+                _build_role_features(pair.role_values),
+                dtype=torch.float32,
+            ),
+            "event_index": torch.tensor(pair.event_index, dtype=torch.long),
+            "event_count": torch.tensor(pair.event_count, dtype=torch.long),
             "text": pair.text,
             "event_text": pair.event_text,
             "doc_id": pair.doc_id,
@@ -210,6 +219,95 @@ def _build_event_features(event_index: int, event_count: int) -> List[float]:
     from_end = (count - 1 - index) / count
     log_count = float(np.log1p(count) / np.log1p(32.0))
     return [rel_pos, from_start, from_end, log_count]
+
+
+ROLE_KEYS: Tuple[str, ...] = (
+    "Att_Subj",
+    "Subj",
+    "Adv",
+    "P",
+    "Cpl",
+    "Att_Obj",
+    "Obj",
+)
+
+
+def _extract_role_values(event_structure: dict) -> Tuple[str, ...]:
+    """Return seven-tuple role texts in the fixed IECE role order."""
+    return tuple(str(event_structure.get(role, "") or "") for role in ROLE_KEYS)
+
+
+def _build_role_features(role_values: Tuple[str, ...]) -> List[float]:
+    """
+    Lightweight role features for the role-aware event encoder.
+
+    The offline embeddings encode the whole event text. These features expose
+    the internal seven-tuple structure without requiring a fresh PLM pass over
+    each role span.
+    """
+    features: List[float] = []
+    for value in role_values:
+        value = value.strip()
+        if not value:
+            features.append(0.0)
+            continue
+        features.append(min(len(value) / 32.0, 1.0))
+    return features
+
+
+class DocumentBatchSampler(Sampler[List[int]]):
+    """Batch event-level rows while keeping events from the same document together."""
+
+    def __init__(
+        self,
+        pairs: List[EventPair],
+        batch_size: int,
+        shuffle: bool,
+        seed: int = Config.RANDOM,
+    ):
+        self.batch_size = max(int(batch_size), 1)
+        self.shuffle = shuffle
+        self.seed = seed
+        self.epoch = 0
+        doc_to_indices: dict[str, List[int]] = {}
+        for idx, pair in enumerate(pairs):
+            doc_to_indices.setdefault(pair.doc_id, []).append(idx)
+        self.doc_groups = list(doc_to_indices.values())
+
+    def __iter__(self) -> Iterator[List[int]]:
+        groups = [group[:] for group in self.doc_groups]
+        if self.shuffle:
+            rng = random.Random(self.seed + self.epoch)
+            rng.shuffle(groups)
+        batch: List[int] = []
+        for group in groups:
+            if batch and len(batch) + len(group) > self.batch_size:
+                yield batch
+                batch = []
+            if len(group) > self.batch_size:
+                if batch:
+                    yield batch
+                    batch = []
+                yield group
+                continue
+            batch.extend(group)
+        if batch:
+            yield batch
+        self.epoch += 1
+
+    def __len__(self) -> int:
+        batches = 0
+        current = 0
+        for group in self.doc_groups:
+            size = len(group)
+            if current and current + size > self.batch_size:
+                batches += 1
+                current = 0
+            if size > self.batch_size:
+                batches += 1
+            else:
+                current += size
+        return batches + int(current > 0)
 
 
 def build_dataloaders(
@@ -248,18 +346,27 @@ def build_dataloaders(
         event_masks=labeled_event_masks,
     )
 
-    train_loader = DataLoader(
-        train_dataset,
+    train_sampler = DocumentBatchSampler(
+        fold_train_pairs,
         batch_size=batch_size,
         shuffle=True,
+    )
+    val_sampler = DocumentBatchSampler(
+        fold_val_pairs,
+        batch_size=batch_size,
+        shuffle=False,
+    )
+
+    train_loader = DataLoader(
+        train_dataset,
+        batch_sampler=train_sampler,
         drop_last=False,
         num_workers=num_workers,
         pin_memory=torch.cuda.is_available(),
     )
     val_loader = DataLoader(
         val_dataset,
-        batch_size=batch_size,
-        shuffle=False,
+        batch_sampler=val_sampler,
         drop_last=False,
         num_workers=num_workers,
         pin_memory=torch.cuda.is_available(),
