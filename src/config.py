@@ -86,6 +86,7 @@ class Config:
     LOSS_WEIGHT_EMOTION: float = 1.0
     LOSS_WEIGHT_CAUSE: float = 1.0
     LOSS_WEIGHT_CENTER: float = 0.2
+    LOSS_WEIGHT_CONTRASTIVE: float = 0.1
     CAUSE_LOSS_TYPE: str = "focal"  # "ce" | "focal"
     CAUSE_FOCAL_GAMMA: float = 1.5
     # Cause labels are event-level and can drift by fold; "balanced" computes
@@ -125,9 +126,12 @@ class Config:
     DL_USE_ROLE_AWARE_EVENT: bool = True
     DL_USE_EVENT_SET_REASONING: bool = True
     DL_USE_SELECTIVE_GATED_REFINEMENT: bool = True
+    DL_USE_HARD_NEGATIVE_CONTRASTIVE: bool = True
     DL_ROLE_COUNT: int = 7
     DL_EVENT_SET_LAYERS: int = 1
     DL_SGMR_RELEVANCE_SCALE: float = 1.0
+    DL_CONTRASTIVE_TEMPERATURE: float = 0.1
+    DL_HARD_NEGATIVE_TOPK: int = 2
 
     @classmethod
     def apply_dataset_type(cls, dataset_type: str | None = None):

@@ -110,6 +110,7 @@ class IMRLoss(nn.Module):
         emotion_weight: float = Config.LOSS_WEIGHT_EMOTION,
         cause_weight: float = Config.LOSS_WEIGHT_CAUSE,
         center_weight: float = Config.LOSS_WEIGHT_CENTER,
+        contrastive_weight: float = Config.LOSS_WEIGHT_CONTRASTIVE,
         cause_class_weights: Optional[torch.Tensor] = None,
     ):
         super().__init__()
@@ -138,6 +139,9 @@ class IMRLoss(nn.Module):
         self.emotion_weight = float(emotion_weight)
         self.cause_weight = float(cause_weight)
         self.center_weight = float(center_weight)
+        self.contrastive_weight = float(contrastive_weight)
+        self.contrastive_temperature = float(Config.DL_CONTRASTIVE_TEMPERATURE)
+        self.hard_negative_topk = int(Config.DL_HARD_NEGATIVE_TOPK)
 
     def forward(
         self,
@@ -147,6 +151,9 @@ class IMRLoss(nn.Module):
         cause_labels: torch.Tensor,
         center_logits: Optional[torch.Tensor] = None,
         center_labels: Optional[torch.Tensor] = None,
+        contrastive_event_states: Optional[torch.Tensor] = None,
+        contrastive_emotion_states: Optional[torch.Tensor] = None,
+        doc_ids: Optional[List[str]] = None,
     ):
         emotion_loss = self.emotion_ce(emotion_logits, emotion_labels)
         if self.cause_loss_type == "focal":
@@ -166,6 +173,21 @@ class IMRLoss(nn.Module):
                 label_smoothing=self.label_smoothing,
             )
             loss = loss + self.center_weight * center_loss
+        if (
+            Config.DL_USE_RSGMR
+            and Config.DL_USE_HARD_NEGATIVE_CONTRASTIVE
+            and self.contrastive_weight > 0
+            and contrastive_event_states is not None
+            and contrastive_emotion_states is not None
+            and doc_ids is not None
+        ):
+            contrastive_loss = self._hard_negative_contrastive_loss(
+                event_states=contrastive_event_states,
+                emotion_states=contrastive_emotion_states,
+                labels=cause_labels,
+                doc_ids=doc_ids,
+            )
+            loss = loss + self.contrastive_weight * contrastive_loss
         return loss
 
     def _focal_cause_loss(
@@ -183,6 +205,46 @@ class IMRLoss(nn.Module):
         pt = torch.softmax(logits, dim=-1).gather(1, labels.unsqueeze(1)).squeeze(1)
         focal = (1.0 - pt).clamp_min(1e-6).pow(self.focal_gamma)
         return (focal * ce).mean()
+
+    def _hard_negative_contrastive_loss(
+        self,
+        event_states: torch.Tensor,
+        emotion_states: torch.Tensor,
+        labels: torch.Tensor,
+        doc_ids: List[str],
+    ) -> torch.Tensor:
+        """InfoNCE over true causes and same-document hard negative events."""
+        event_norm = F.normalize(event_states, dim=-1)
+        emotion_norm = F.normalize(emotion_states, dim=-1)
+        doc_to_indices: Dict[str, List[int]] = {}
+        for idx, doc_id in enumerate(doc_ids):
+            doc_to_indices.setdefault(str(doc_id), []).append(idx)
+
+        losses: List[torch.Tensor] = []
+        for indices in doc_to_indices.values():
+            positives = [i for i in indices if int(labels[i].item()) == 1]
+            negatives = [i for i in indices if int(labels[i].item()) == 0]
+            if not positives or not negatives:
+                continue
+            neg_tensor = torch.tensor(negatives, device=event_states.device, dtype=torch.long)
+            neg_states = event_norm.index_select(0, neg_tensor)
+            for pos_idx in positives:
+                pos_state = event_norm[pos_idx]
+                sim_to_pos = torch.matmul(neg_states, pos_state)
+                k = min(self.hard_negative_topk, len(negatives))
+                hard_local = torch.topk(sim_to_pos, k=k).indices
+                hard_neg_states = neg_states.index_select(0, hard_local)
+                doc_emotion = emotion_norm[pos_idx]
+                pos_logit = torch.sum(doc_emotion * pos_state).unsqueeze(0)
+                neg_logits = torch.matmul(hard_neg_states, doc_emotion)
+                logits = torch.cat([pos_logit, neg_logits], dim=0).unsqueeze(0)
+                logits = logits / max(self.contrastive_temperature, 1e-6)
+                target = torch.zeros(1, dtype=torch.long, device=event_states.device)
+                losses.append(F.cross_entropy(logits, target))
+
+        if not losses:
+            return event_states.new_zeros(())
+        return torch.stack(losses).mean()
 
 
 # ===========================================================================
@@ -746,6 +808,9 @@ class IMRModel(nn.Module):
 
         self.cause_head = nn.Sequential(
             nn.Dropout(dropout),
+            nn.Linear(d_model * 4, d_model),
+            nn.GELU(),
+            nn.Dropout(dropout),
             nn.Linear(d_model, d_model // 2),
             nn.GELU(),
             nn.Dropout(dropout),
@@ -816,19 +881,19 @@ class IMRModel(nn.Module):
                 {
                     "iteration": torch.tensor(iteration_idx),
                     "emotion_logits": self.emotion_head(emo).detach().cpu(),
-                    "cause_logits": self.cause_head(cau).detach().cpu(),
+                    "cause_logits": self._predict_cause_logits(cau, emo, None).detach().cpu(),
                 }
             )
 
         # Variant 1: w/o IMR - both tasks are independent, with no interaction.
         if self.ablation_mode == "wo_imr":
             emotion_logits = self.emotion_head(emo_state)  # (B, num_emotions)
-            cause_logits = self._predict_cause_logits(cause_state, center_logits)
+            cause_logits = self._predict_cause_logits(cause_state, emo_state, center_logits)
             _record(0, emo_state, cause_state)
             if return_intermediate:
                 return emotion_logits, cause_logits, intermediates
             if return_auxiliary:
-                return emotion_logits, cause_logits, center_logits
+                return emotion_logits, cause_logits, center_logits, cause_state, emo_state
             return emotion_logits, cause_logits
 
         # Variant 2: w/o Backward - keep only one-way Emotion -> Cause interaction.
@@ -845,11 +910,11 @@ class IMRModel(nn.Module):
 
             emotion_logits = self.emotion_head(emo_state)  # (B, num_emotions)
             cause_pred_state = self.cause_output_conditioner(cause_state, emo_state)
-            cause_logits = self._predict_cause_logits(cause_pred_state, center_logits)
+            cause_logits = self._predict_cause_logits(cause_pred_state, emo_state, center_logits)
             if return_intermediate:
                 return emotion_logits, cause_logits, intermediates
             if return_auxiliary:
-                return emotion_logits, cause_logits, center_logits
+                return emotion_logits, cause_logits, center_logits, cause_state, emo_state
             return emotion_logits, cause_logits
 
         # ===== Stage 3: T rounds of iterative interaction =====
@@ -885,20 +950,30 @@ class IMRModel(nn.Module):
         # ===== Stage 4: final prediction =====
         emotion_logits = self.emotion_head(emo_state)  # (B, 7)
         cause_pred_state = self.cause_output_conditioner(cause_state, emo_state)
-        cause_logits = self._predict_cause_logits(cause_pred_state, center_logits)
+        cause_logits = self._predict_cause_logits(cause_pred_state, emo_state, center_logits)
 
         if return_intermediate:
             return emotion_logits, cause_logits, intermediates
         if return_auxiliary:
-            return emotion_logits, cause_logits, center_logits
+            return emotion_logits, cause_logits, center_logits, cause_state, emo_state
         return emotion_logits, cause_logits
 
     def _predict_cause_logits(
         self,
         cause_state: torch.Tensor,
+        emotion_state: torch.Tensor,
         center_logits: Optional[torch.Tensor],
     ) -> torch.Tensor:
-        cause_logits = self.cause_head(cause_state)
+        cause_features = torch.cat(
+            [
+                cause_state,
+                emotion_state,
+                cause_state * emotion_state,
+                torch.abs(cause_state - emotion_state),
+            ],
+            dim=-1,
+        )
+        cause_logits = self.cause_head(cause_features)
         if Config.DL_USE_CENTER_EVENT_PRIOR and center_logits is not None:
             cause_logits = cause_logits + float(Config.DL_CENTER_PRIOR_LOGIT_SCALE) * center_logits
         return cause_logits
